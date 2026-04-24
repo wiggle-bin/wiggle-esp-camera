@@ -75,9 +75,11 @@ void addressToString(DeviceAddress deviceAddress, char* buffer) {
 #define NUM_LEDS 8
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-// Servo removed
-
+// Camera configuration
 #define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
+
+// === Power Mode ===
+#define LOW_POWER_MODE true // Set to true for low power (grayscale, small image)
 #include "camera_pins.h"
 
 unsigned long lastCaptureTime = 0; // Last shooting time
@@ -196,6 +198,7 @@ void setup() {
 
   // Servo removed
   
+
   // === Camera Init ===
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -217,13 +220,15 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  // config.frame_size = FRAMESIZE_QVGA;   // 352x288 (use FRAMESIZE_QQVGA for ML on devive)
-  // config.pixel_format = PIXFORMAT_JPEG; // Hardware JPEG (use PIXFORMAT_GRAYSCALE for ML on device)
-  // config.jpeg_quality = 12;             // Adjust 10–15 for size/quality balance
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_SVGA;  // 800x600
-  config.jpeg_quality = 8;             // 10 = better quality (1-63)
-  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  if (LOW_POWER_MODE) {
+    config.pixel_format = PIXFORMAT_JPEG;      // Use JPEG for compatibility
+    config.frame_size   = FRAMESIZE_QVGA;      // 320x240, small but enough for activity
+    config.jpeg_quality = 15;                  // Lower quality for smaller size
+  } else {
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size   = FRAMESIZE_SVGA;      // 800x600
+    config.jpeg_quality = 8;                   // Higher quality
+  }
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.fb_count = 2;
