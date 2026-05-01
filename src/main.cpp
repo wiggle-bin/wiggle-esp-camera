@@ -120,10 +120,7 @@ void turnOnLedRing(uint8_t r = 255, uint8_t g = 0, uint8_t b = 0, uint8_t bright
 
 void turnOffLedRing()
 {
-  for (int i = 0; i < NUM_LEDS; i++)
-  {
-    strip.setPixelColor(i, 0);
-  }
+  strip.clear();
   strip.show();
 }
 
@@ -475,6 +472,11 @@ void loop()
 
   if (DEEP_SLEEP)
   {
+    // Turn off WiFi and Bluetooth to minimize power consumption
+    // Have to check if this is actually needed
+    WiFi.mode(WIFI_OFF);
+    btStop();
+    // Enter Deep sleep
     Serial.printf("Entering deep sleep for %.2f minutes...\n", (double)DEEP_SLEEP_INTERVAL_US / 60000000.0);
     esp_sleep_enable_timer_wakeup(DEEP_SLEEP_INTERVAL_US);
     Serial.flush();
