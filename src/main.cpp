@@ -88,14 +88,14 @@ Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // === Feature Toggles ===
 #define LIGHT_ALWAYS_ON false       // Set to true to keep LED ring on (soft white)
-#define READ_SENSORS_MINUTES 1      // Time in minutes between sensor readings
+#define READ_SENSORS_MINUTES 0.2      // Time in minutes between sensor readings
 #define READ_SENSORS_INTERVAL (READ_SENSORS_MINUTES * 60UL * 1000UL) // Time in ms
 
 // === Energy saving Toggles ===
 #define TAKE_PICTURES true          // Set to false to disable all photo capture/sending
-#define SMALL_IMAGE_SIZE true       // Set to true for smaller images to reduce battery drainage
+#define SMALL_IMAGE_SIZE false       // Set to true for smaller images to reduce battery drainage
 #define DEEP_SLEEP true             // Set to true deep sleep between sensor readings and photo captures
-#define DEEP_SLEEP_MINUTES 30       // Deep sleep duration in minutes
+#define DEEP_SLEEP_MINUTES 0.2       // Deep sleep duration in minutes
 #define DEEP_SLEEP_INTERVAL_US (DEEP_SLEEP_MINUTES * 60ULL * 1000000ULL)
 
 // === Storage Option ===
@@ -156,6 +156,13 @@ void photo_save(const char *fileName, const bool sd_sign)
   turnOnLedRing(); // Default: white at brightness 30
   delay(1000);     // Give time for illumination
 
+  sensor_t* sensor = esp_camera_sensor_get();
+  // To turn sensor out of deel sleep mode. Have to check if this is actually needed.
+  // Based on form https://forum.seeedstudio.com/t/xiao-esp32s3-sense-camera-sleep-current/271258/32?page=3
+  if (sensor && DEEP_SLEEP) {
+     sensor->set_reg(sensor, 0x3008, 0x40, 0x00);
+  }
+
   camera_fb_t *fb = esp_camera_fb_get(); // dummy read
   if (fb)
     esp_camera_fb_return(fb); // return dummy
@@ -190,6 +197,7 @@ void photo_save(const char *fileName, const bool sd_sign)
   {
     // Save photo to file
     writeFile(SD, fileName, fb->buf, fb->len);
+    Serial.println("Photo saved to file");
   }
   else
   {
@@ -199,7 +207,10 @@ void photo_save(const char *fileName, const bool sd_sign)
   // Release image buffer
   esp_camera_fb_return(fb);
 
-  Serial.println("Photo saved to file");
+  // Power down camera sensor after use to save energy
+  if (sensor && DEEP_SLEEP) {
+    sensor->set_reg(sensor, 0x3008, 0x40, 0x40);
+  }
 
   delay(1000);
   if (LIGHT_ALWAYS_ON)
