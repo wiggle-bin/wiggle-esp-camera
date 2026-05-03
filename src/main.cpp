@@ -343,38 +343,42 @@ void setup()
 
   camera_sign = true; // Camera initialization check passes
 
-  // Initialize SD card
-  if (!SD.begin(21))
-  {
-    Serial.println("Card Mount Failed");
-  }
-  uint8_t cardType = SD.cardType();
+  #if SAVE_TO_SD_CARD
+    // Initialize SD card
+    if (!SD.begin(21))
+    {
+      Serial.println("Card Mount Failed");
+    }
+    uint8_t cardType = SD.cardType();
 
-  // Determine if the type of SD card is available
-  if (cardType == CARD_NONE)
-  {
-    Serial.println("No SD card attached");
-  }
+    // Determine if the type of SD card is available
+    if (cardType == CARD_NONE)
+    {
+      Serial.println("No SD card attached");
+    }
 
-  Serial.print("SD Card Type: ");
-  if (cardType == CARD_MMC)
-  {
-    Serial.println("MMC");
-  }
-  else if (cardType == CARD_SD)
-  {
-    Serial.println("SDSC");
-  }
-  else if (cardType == CARD_SDHC)
-  {
-    Serial.println("SDHC");
-  }
-  else
-  {
-    Serial.println("UNKNOWN");
-  }
+    Serial.print("SD Card Type: ");
+    if (cardType == CARD_MMC)
+    {
+      Serial.println("MMC");
+    }
+    else if (cardType == CARD_SD)
+    {
+      Serial.println("SDSC");
+    }
+    else if (cardType == CARD_SDHC)
+    {
+      Serial.println("SDHC");
+    }
+    else
+    {
+      Serial.println("UNKNOWN");
+    }
 
-  sd_sign = true; // sd initialization check passes
+    sd_sign = true; // sd initialization check passes
+  #else
+    sd_sign = false;
+  #endif
 
   // Temp
   sensors.begin();
@@ -482,7 +486,6 @@ void loop()
     // Turn LED ring power off via NPN transistor to save energy during deep sleep
     digitalWrite(NPN_TRANSISTOR_PIN, LOW);  // NPN OFF
     digitalWrite(LED_PIN, HIGH);
-    delay(1000);
     // Turn off WiFi and Bluetooth to minimize power consumption
     // Have to check if this is actually needed
     WiFi.mode(WIFI_OFF);
