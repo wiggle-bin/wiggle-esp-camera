@@ -78,6 +78,9 @@ void addressToString(DeviceAddress deviceAddress, char *buffer)
           deviceAddress[4], deviceAddress[5], deviceAddress[6], deviceAddress[7]);
 }
 
+// Pin connected to 2N2222A base (GPIO3) to turn off power to LED ring via NPN transistor
+#define NPN_TRANSISTOR_PIN 3
+
 // LED ring
 #define LED_PIN 44 // Adjust if using a different GPIO
 #define NUM_LEDS 8
@@ -259,6 +262,10 @@ void reconnect()
 
 void setup()
 {
+  // Turn on power to LED ring via PNP transistor
+  pinMode(NPN_TRANSISTOR_PIN, OUTPUT);
+  digitalWrite(NPN_TRANSISTOR_PIN, HIGH); 
+
   if (LIGHT_ALWAYS_ON)
   {
     // Soft white, low brightness (e.g., 64 out of 255)
@@ -472,6 +479,10 @@ void loop()
 
   if (DEEP_SLEEP)
   {
+    // Turn LED ring power off via NPN transistor to save energy during deep sleep
+    digitalWrite(NPN_TRANSISTOR_PIN, LOW);  // NPN OFF
+    digitalWrite(LED_PIN, HIGH);
+    delay(1000);
     // Turn off WiFi and Bluetooth to minimize power consumption
     // Have to check if this is actually needed
     WiFi.mode(WIFI_OFF);
