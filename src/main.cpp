@@ -4,6 +4,8 @@
 #include "SD.h"
 #include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
+#include <esp_now.h>
+#include "esp_wifi.h"
 #include <PubSubClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -16,13 +18,20 @@
 
 // === Image diff and conditional send ===
 #define BASE_IMAGE_SIZE (160 * 120) // For FRAMESIZE_QQVGA, grayscale
-#define CHANGE_THRESHOLD 20         // Adjust for sensitivity
+#define DOWNSAMPLED_WIDTH 80
+#define DOWNSAMPLED_HEIGHT 60
+#define DOWNSAMPLED_IMAGE_SIZE (DOWNSAMPLED_WIDTH * DOWNSAMPLED_HEIGHT)
+#define DOWNSAMPLED_PACKED_SIZE (DOWNSAMPLED_IMAGE_SIZE / 2) // 2 pixels per byte (4 bits each)
+#define CHANGE_THRESHOLD 0         // Adjust for sensitivity
+
 
 uint8_t baseImage[BASE_IMAGE_SIZE];
 bool baseImageValid = false;
+uint8_t downsampledImage[DOWNSAMPLED_IMAGE_SIZE];
+uint8_t packedImage[DOWNSAMPLED_PACKED_SIZE];
 
-// Send images
-const char *serverBaseUrl = "http://homeassistant.local:8123/api/wiggle/upload";
+// ESP-NOW peer MAC address (replace with your receiver's MAC)
+uint8_t peerAddress[] = RECEIVER_MAC;
 
 // Utility: generate a timestamp string (optional)
 String getTimestampedFilename()
@@ -34,36 +43,74 @@ String getTimestampedFilename()
   return String(buffer);
 }
 
-// Send photo from RAM
-void sendPhoto(camera_fb_t *fb)
-{
-  if (!fb || !fb->buf || fb->len == 0)
-  {
-    Serial.println("Invalid frame buffer");
-    return;
+// Debug: Send a simple "hello" ESP-NOW packet
+void sendHelloESPNow() {
+  const char *msg = "hello";
+  esp_err_t result = esp_now_send(peerAddress, (const uint8_t *)msg, strlen(msg));
+  if (result == ESP_OK) {
+    Serial.println("ESP-NOW hello sent");
+  } else {
+    Serial.printf("ESP-NOW hello send failed: %d\n", result);
   }
-
-  String fileName = getTimestampedFilename();
-  String serverUrl = String(serverBaseUrl);
-
-  HTTPClient http;
-  http.begin(serverUrl);
-  http.addHeader("Content-Type", "image/jpeg");
-
-  int httpResponseCode = http.POST(fb->buf, fb->len);
-  if (httpResponseCode > 0)
-  {
-    Serial.printf("Photo sent successfully! Response: %d\n", httpResponseCode);
-  }
-  else
-  {
-    Serial.printf("Photo send failed: %s\n", http.errorToString(httpResponseCode).c_str());
-  }
-
-  http.end();
 }
 
-// MQTT client
+// === Image Downsampling and Packing ===
+// Downsample 160x120 grayscale to 80x60 (simple 2x2 average)
+void downsample_160x120_to_80x60(const uint8_t *src, uint8_t *dst) {
+  for (int y = 0; y < DOWNSAMPLED_HEIGHT; ++y) {
+    for (int x = 0; x < DOWNSAMPLED_WIDTH; ++x) {
+      int sum = 0;
+      int src_x = x * 2;
+      int src_y = y * 2;
+      sum += src[(src_y + 0) * 160 + (src_x + 0)];
+      sum += src[(src_y + 0) * 160 + (src_x + 1)];
+      sum += src[(src_y + 1) * 160 + (src_x + 0)];
+      sum += src[(src_y + 1) * 160 + (src_x + 1)];
+      dst[y * DOWNSAMPLED_WIDTH + x] = sum / 4;
+    }
+  }
+}
+
+// Quantize 8-bit grayscale to 4-bit (0-15)
+inline uint8_t quantize_4bit(uint8_t v) {
+  return v >> 4; // 0-255 -> 0-15
+}
+
+// Pack 4-bit grayscale pixels (2 per byte)
+void pack_4bit(const uint8_t *src, uint8_t *dst, int num_pixels) {
+  for (int i = 0; i < num_pixels / 2; ++i) {
+    uint8_t hi = quantize_4bit(src[i * 2]);
+    uint8_t lo = quantize_4bit(src[i * 2 + 1]);
+    dst[i] = (hi << 4) | (lo & 0x0F);
+  }
+}
+
+// === ESP-NOW Transmission ===
+void sendImageESPNow(const uint8_t *packed, size_t packed_len) {
+  // ESP-NOW max payload is 250 bytes
+  const size_t CHUNK_SIZE = 200; // Leave room for header
+  uint16_t total_chunks = (packed_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  for (uint16_t chunk = 0; chunk < total_chunks; ++chunk) {
+    size_t offset = chunk * CHUNK_SIZE;
+    size_t len = (offset + CHUNK_SIZE > packed_len) ? (packed_len - offset) : CHUNK_SIZE;
+    uint8_t buf[CHUNK_SIZE + 4];
+    buf[0] = (uint8_t)(chunk & 0xFF);
+    buf[1] = (uint8_t)((chunk >> 8) & 0xFF);
+    buf[2] = (uint8_t)(total_chunks & 0xFF);
+    buf[3] = (uint8_t)((total_chunks >> 8) & 0xFF);
+    memcpy(buf + 4, packed + offset, len);
+    esp_err_t result = esp_now_send(peerAddress, buf, len + 4);
+    if (result == ESP_OK) {
+      Serial.printf("ESP-NOW chunk %d/%d sent\n", chunk + 1, total_chunks);
+    } else {
+      Serial.printf("ESP-NOW send failed: %d\n", result);
+    }
+    delay(10); // Give time for radio
+  }
+}
+
+
+// MQTT client (unused, but kept for compatibility)
 WiFiClient espClient;
 PubSubClient client(espClient);
 
@@ -202,7 +249,7 @@ void photo_save(const char *fileName, const bool sd_sign)
   }
 
   // Post photo
-  sendPhoto(fb);
+  // sendPhoto(fb);
   
   if (!SAVE_TO_SD_CARD)
   {
@@ -242,16 +289,30 @@ void photo_save(const char *fileName, const bool sd_sign)
 // === Globals ===
 int photoCount = 0;
 
-void setup_wifi()
-{
-  Serial.print("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
+
+// ESP-NOW setup
+// Set this to your receiver's WiFi channel (print WiFi.channel() on receiver after WiFi connects)
+#define RECEIVER_WIFI_CHANNEL 9 // <-- CHANGE THIS to your actual WiFi channel
+
+void setup_espnow() {
+  WiFi.mode(WIFI_STA);
+  // Set WiFi channel to match receiver
+  esp_wifi_set_channel(RECEIVER_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  Serial.print("ESP-NOW sender using channel: ");
+  Serial.println(RECEIVER_WIFI_CHANNEL);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
   }
-  Serial.println(" connected.");
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, peerAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (!esp_now_is_peer_exist(peerAddress)) {
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Failed to add ESP-NOW peer");
+    }
+  }
 }
 
 void reconnect()
@@ -276,6 +337,10 @@ void reconnect()
 void setup() {
   setupStartTime = millis();
   
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+
   // Initialize EEPROM for base image persistence
   EEPROM.begin(BASE_IMAGE_SIZE + 1);
   baseImageValid = EEPROM.read(0) == 1;
@@ -293,13 +358,8 @@ void setup() {
     turnOnLedRing(255, 255, 255, 64);
   }
 
-  Serial.begin(115200);
-  Serial.setDebugOutput(true);
-  Serial.println();
-
-  // === Wifi and MQTT server ===
-  // setup_wifi(); // Only connect when sending image
-  // client.setServer(mqtt_server, mqtt_port);
+  // === ESP-NOW ===
+  setup_espnow();
 
   // === Camera Init ===
   camera_config_t config;
@@ -476,6 +536,7 @@ void loop() {
   // }
 
   // === Conditional image capture and send ===
+
   bool shouldSend = false;
   camera_fb_t *fb = esp_camera_fb_get();
 
@@ -516,10 +577,11 @@ void loop() {
   }
 
   if (shouldSend) {
-    setup_wifi();
-    sendPhoto(fb);
+    // Downsample and send via ESP-NOW
+    downsample_160x120_to_80x60((uint8_t*)fb->buf, downsampledImage);
+    pack_4bit(downsampledImage, packedImage, DOWNSAMPLED_IMAGE_SIZE);
+    sendImageESPNow(packedImage, DOWNSAMPLED_PACKED_SIZE);
   }
-
 
   esp_camera_fb_return(fb);
 
