@@ -27,21 +27,7 @@ Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define DEEP_SLEEP_MINUTES 0.2       // Deep sleep duration in minutes
 #define DEEP_SLEEP_INTERVAL_US (DEEP_SLEEP_MINUTES * 60ULL * 1000000ULL)
 
-// Utility: generate a timestamp string (optional)
-String getTimestampedFilename()
-{
-  time_t now = time(nullptr);
-  struct tm *timeinfo = localtime(&now);
-  char buffer[32];
-  strftime(buffer, sizeof(buffer), "esp32_%Y%m%d_%H%M%S.jpg", timeinfo);
-  return String(buffer);
-}
-
 WiFiClient espClient;
-
-unsigned long lastCaptureTime = 0; // Last shooting time
-int imageCount = 1;                // File Counter
-bool sd_sign = false;              // Check sd status
 
 // Timing variables
 unsigned long setupStartTime = 0;
