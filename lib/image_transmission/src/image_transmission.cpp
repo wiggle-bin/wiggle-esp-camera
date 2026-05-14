@@ -1,13 +1,102 @@
 #include "image_transmission.h"
 
 #include <Arduino.h>
+#include <EEPROM.h>
+#include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 
-extern uint8_t peerAddress[];
+bool initializeESPNowSender(const ImageTransmissionConfig &config) {
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(config.wifiChannel, WIFI_SECOND_CHAN_NONE);
+  Serial.print("ESP-NOW sender using channel: ");
+  Serial.println(config.wifiChannel);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return false;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, config.peerAddress, sizeof(config.peerAddress));
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (!esp_now_is_peer_exist(config.peerAddress)) {
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Failed to add ESP-NOW peer");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void initializeBaseImagePersistence(ImageTransmissionState &state) {
+  EEPROM.begin(IMAGE_TRANSMISSION_BASE_IMAGE_SIZE + 1);
+  state.baseImageValid = EEPROM.read(0) == 1;
+  if (!state.baseImageValid) {
+    return;
+  }
+
+  for (size_t i = 0; i < IMAGE_TRANSMISSION_BASE_IMAGE_SIZE; ++i) {
+    state.baseImage[i] = EEPROM.read(i + 1);
+  }
+}
+
+void processFrameAndSendIfChanged(const uint8_t *frame,
+                                  ImageTransmissionState &state,
+                                  const ImageTransmissionConfig &config) {
+  bool shouldSend = false;
+
+  if (!state.baseImageValid) {
+    memcpy(state.baseImage, frame, IMAGE_TRANSMISSION_BASE_IMAGE_SIZE);
+    state.baseImageValid = true;
+    Serial.println("Base image captured.");
+    EEPROM.write(0, 1);
+    for (size_t i = 0; i < IMAGE_TRANSMISSION_BASE_IMAGE_SIZE; ++i) {
+      EEPROM.write(i + 1, state.baseImage[i]);
+    }
+    EEPROM.commit();
+    return;
+  }
+
+  int diffSum = 0;
+  for (size_t i = 0; i < IMAGE_TRANSMISSION_BASE_IMAGE_SIZE; ++i) {
+    diffSum += abs((int)frame[i] - (int)state.baseImage[i]);
+  }
+
+  int meanDiff = diffSum / IMAGE_TRANSMISSION_BASE_IMAGE_SIZE;
+  Serial.printf("Mean pixel diff: %d\n", meanDiff);
+  if (meanDiff > config.changeThreshold) {
+    shouldSend = true;
+    Serial.println("Change detected, sending image...");
+    memcpy(state.baseImage, frame, IMAGE_TRANSMISSION_BASE_IMAGE_SIZE);
+    EEPROM.write(0, 1);
+    for (size_t i = 0; i < IMAGE_TRANSMISSION_BASE_IMAGE_SIZE; ++i) {
+      EEPROM.write(i + 1, state.baseImage[i]);
+    }
+    EEPROM.commit();
+  } else {
+    Serial.println("No significant change.");
+  }
+
+  if (!shouldSend) {
+    return;
+  }
+
+  downsample_160x120_to_80x60(frame, state.downsampledImage);
+  pack_4bit(state.downsampledImage,
+            state.packedImage,
+            IMAGE_TRANSMISSION_DOWNSAMPLED_IMAGE_SIZE);
+  sendImageESPNow(config.peerAddress,
+                  state.packedImage,
+                  IMAGE_TRANSMISSION_DOWNSAMPLED_PACKED_SIZE);
+}
 
 void downsample_160x120_to_80x60(const uint8_t *src, uint8_t *dst) {
-  for (int y = 0; y < DOWNSAMPLED_HEIGHT; ++y) {
-    for (int x = 0; x < DOWNSAMPLED_WIDTH; ++x) {
+  for (int y = 0; y < IMAGE_TRANSMISSION_DOWNSAMPLED_HEIGHT; ++y) {
+    for (int x = 0; x < IMAGE_TRANSMISSION_DOWNSAMPLED_WIDTH; ++x) {
       int sum = 0;
       int src_x = x * 2;
       int src_y = y * 2;
@@ -15,7 +104,7 @@ void downsample_160x120_to_80x60(const uint8_t *src, uint8_t *dst) {
       sum += src[(src_y + 0) * 160 + (src_x + 1)];
       sum += src[(src_y + 1) * 160 + (src_x + 0)];
       sum += src[(src_y + 1) * 160 + (src_x + 1)];
-      dst[y * DOWNSAMPLED_WIDTH + x] = sum / 4;
+      dst[y * IMAGE_TRANSMISSION_DOWNSAMPLED_WIDTH + x] = sum / 4;
     }
   }
 }
@@ -28,7 +117,7 @@ void pack_4bit(const uint8_t *src, uint8_t *dst, int num_pixels) {
   }
 }
 
-void sendImageESPNow(const uint8_t *packed, size_t packed_len) {
+void sendImageESPNow(const uint8_t *peerAddress, const uint8_t *packed, size_t packed_len) {
   const size_t chunkSize = 200;
   uint16_t total_chunks = (packed_len + chunkSize - 1) / chunkSize;
 

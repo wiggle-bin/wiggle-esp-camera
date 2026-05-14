@@ -3,27 +3,11 @@
 #include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
 #include "esp_camera.h"
-#include <esp_now.h>
-#include "esp_wifi.h"
 #include <esp_sleep.h>
-#include <EEPROM.h>
 #include "image_transmission.h"
 
-// === Image diff and conditional send ===
-#define BASE_IMAGE_SIZE (160 * 120) // For FRAMESIZE_QQVGA, grayscale
-#define DOWNSAMPLED_WIDTH 80
-#define DOWNSAMPLED_HEIGHT 60
-#define DOWNSAMPLED_IMAGE_SIZE (DOWNSAMPLED_WIDTH * DOWNSAMPLED_HEIGHT)
-#define DOWNSAMPLED_PACKED_SIZE (DOWNSAMPLED_IMAGE_SIZE / 2) // 2 pixels per byte (4 bits each)
-#define CHANGE_THRESHOLD 0         // Adjust for sensitivity
-
-uint8_t baseImage[BASE_IMAGE_SIZE];
-bool baseImageValid = false;
-uint8_t downsampledImage[DOWNSAMPLED_IMAGE_SIZE];
-uint8_t packedImage[DOWNSAMPLED_PACKED_SIZE];
-
-// ESP-NOW peer MAC address (replace with your receiver's MAC)
-uint8_t peerAddress[] = RECEIVER_MAC;
+ImageTransmissionState imageTransmissionState;
+ImageTransmissionConfig imageTransmissionConfig = {RECEIVER_MAC, 9, 0};
 
 // Pin connected to 2N2222A base (GPIO3) to turn off power to LED ring via NPN transistor
 #define NPN_TRANSISTOR_PIN 3
@@ -58,20 +42,6 @@ String getTimestampedFilename()
   strftime(buffer, sizeof(buffer), "esp32_%Y%m%d_%H%M%S.jpg", timeinfo);
   return String(buffer);
 }
-
-// Debug: Send a simple "hello" ESP-NOW packet
-void sendHelloESPNow() {
-  const char *msg = "hello";
-  esp_err_t result = esp_now_send(peerAddress, (const uint8_t *)msg, strlen(msg));
-  if (result == ESP_OK) {
-    Serial.println("ESP-NOW hello sent");
-  } else {
-    Serial.printf("ESP-NOW hello send failed: %d\n", result);
-  }
-}
-
-
-
 
 WiFiClient espClient;
 
@@ -165,31 +135,6 @@ void photo_save(const char *fileName, const bool sd_sign)
 int photoCount = 0;
 
 
-// ESP-NOW setup
-// Set this to your receiver's WiFi channel (print WiFi.channel() on receiver after WiFi connects)
-#define RECEIVER_WIFI_CHANNEL 9 // <-- CHANGE THIS to your actual WiFi channel
-
-void setup_espnow() {
-  WiFi.mode(WIFI_STA);
-  // Set WiFi channel to match receiver
-  esp_wifi_set_channel(RECEIVER_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  Serial.print("ESP-NOW sender using channel: ");
-  Serial.println(RECEIVER_WIFI_CHANNEL);
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
-  }
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, peerAddress, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-  if (!esp_now_is_peer_exist(peerAddress)) {
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.println("Failed to add ESP-NOW peer");
-    }
-  }
-}
-
 void setup() {
   setupStartTime = millis();
   
@@ -197,12 +142,7 @@ void setup() {
   Serial.setDebugOutput(true);
   Serial.println();
 
-  // Initialize EEPROM for base image persistence
-  EEPROM.begin(BASE_IMAGE_SIZE + 1);
-  baseImageValid = EEPROM.read(0) == 1;
-  if (baseImageValid) {
-    for (int i = 0; i < BASE_IMAGE_SIZE; ++i) baseImage[i] = EEPROM.read(i + 1);
-  }
+  initializeBaseImagePersistence(imageTransmissionState);
 
   // // Turn on power to LED ring via PNP transistor
   // pinMode(NPN_TRANSISTOR_PIN, OUTPUT);
@@ -215,7 +155,7 @@ void setup() {
   }
 
   // === ESP-NOW ===
-  setup_espnow();
+  initializeESPNowSender(imageTransmissionConfig);
 
   // === Camera Init ===
   camera_config_t config;
@@ -283,50 +223,13 @@ void loop() {
 
   camera_fb_t *fb = esp_camera_fb_get();
 
-  bool shouldSend = false;
-
-  if (!fb || fb->len != BASE_IMAGE_SIZE) {
+  if (!fb || fb->len != IMAGE_TRANSMISSION_BASE_IMAGE_SIZE) {
     Serial.println("Camera capture failed or unexpected size");
     if (fb) esp_camera_fb_return(fb);
     goto sleep;
   }
 
-  if (!baseImageValid) {
-    // First boot: store as base image
-    memcpy(baseImage, fb->buf, BASE_IMAGE_SIZE);
-    baseImageValid = true;
-    Serial.println("Base image captured.");
-    // Save to EEPROM
-    EEPROM.write(0, 1);
-    for (int i = 0; i < BASE_IMAGE_SIZE; ++i) EEPROM.write(i + 1, baseImage[i]);
-    EEPROM.commit();
-  } else {
-    // Compare with base image
-    int diffSum = 0;
-    for (int i = 0; i < BASE_IMAGE_SIZE; ++i) {
-      diffSum += abs((int)fb->buf[i] - (int)baseImage[i]);
-    }
-    int meanDiff = diffSum / BASE_IMAGE_SIZE;
-    Serial.printf("Mean pixel diff: %d\n", meanDiff);
-    if (meanDiff > CHANGE_THRESHOLD) {
-      shouldSend = true;
-      Serial.println("Change detected, sending image...");
-      // Update base image
-      memcpy(baseImage, fb->buf, BASE_IMAGE_SIZE);
-      EEPROM.write(0, 1);
-      for (int i = 0; i < BASE_IMAGE_SIZE; ++i) EEPROM.write(i + 1, baseImage[i]);
-      EEPROM.commit();
-    } else {
-      Serial.println("No significant change.");
-    }
-  }
-
-  if (shouldSend) {
-    // Downsample and send via ESP-NOW
-    downsample_160x120_to_80x60((uint8_t*)fb->buf, downsampledImage);
-    pack_4bit(downsampledImage, packedImage, DOWNSAMPLED_IMAGE_SIZE);
-    sendImageESPNow(packedImage, DOWNSAMPLED_PACKED_SIZE);
-  }
+  processFrameAndSendIfChanged(fb->buf, imageTransmissionState, imageTransmissionConfig);
 
   esp_camera_fb_return(fb);
 
