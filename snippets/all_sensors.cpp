@@ -1,10 +1,18 @@
 #include <Arduino.h>
-#include "env.h"
+#include "esp_camera.h"
+#include "FS.h"
+#include "SD.h"
 #include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
-#include "esp_camera.h"
 #include <esp_now.h>
 #include "esp_wifi.h"
+#include <PubSubClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "env.h"
+#include <Wire.h>
+#include <BH1750.h>
+#include <HTTPClient.h>
 #include <esp_sleep.h>
 #include <EEPROM.h>
 
@@ -16,6 +24,7 @@
 #define DOWNSAMPLED_PACKED_SIZE (DOWNSAMPLED_IMAGE_SIZE / 2) // 2 pixels per byte (4 bits each)
 #define CHANGE_THRESHOLD 0         // Adjust for sensitivity
 
+
 uint8_t baseImage[BASE_IMAGE_SIZE];
 bool baseImageValid = false;
 uint8_t downsampledImage[DOWNSAMPLED_IMAGE_SIZE];
@@ -23,30 +32,6 @@ uint8_t packedImage[DOWNSAMPLED_PACKED_SIZE];
 
 // ESP-NOW peer MAC address (replace with your receiver's MAC)
 uint8_t peerAddress[] = RECEIVER_MAC;
-
-// Pin connected to 2N2222A base (GPIO3) to turn off power to LED ring via NPN transistor
-#define NPN_TRANSISTOR_PIN 3
-
-// LED ring
-#define LED_PIN 44 // Adjust if using a different GPIO
-#define NUM_LEDS 8
-
-Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-// Camera configuration
-#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
-
-// === Feature Toggles ===
-#define LIGHT_ALWAYS_ON false       // Set to true to keep LED ring on (soft white)
-#define READ_SENSORS_MINUTES 0.2      // Time in minutes between sensor readings
-#define READ_SENSORS_INTERVAL (READ_SENSORS_MINUTES * 60UL * 1000UL) // Time in ms
-
-// === Energy saving Toggles ===
-#define DEEP_SLEEP true             // Set to true deep sleep between sensor readings and photo captures
-#define DEEP_SLEEP_MINUTES 0.2       // Deep sleep duration in minutes
-#define DEEP_SLEEP_INTERVAL_US (DEEP_SLEEP_MINUTES * 60ULL * 1000000ULL)
-
-#include "camera_pins.h"
 
 // Utility: generate a timestamp string (optional)
 String getTimestampedFilename()
@@ -125,7 +110,57 @@ void sendImageESPNow(const uint8_t *packed, size_t packed_len) {
 }
 
 
+// MQTT client (unused, but kept for compatibility)
 WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Light sensor
+BH1750 lightMeter;
+
+// DS18B20 setup
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// Calibration and sensor config
+// #define NUM_SENSORS 3
+// float calibrationOffsets[NUM_SENSORS] = {0.0, 0.0, 0.0};
+
+void addressToString(DeviceAddress deviceAddress, char *buffer)
+{
+  sprintf(buffer, "%02X%02X%02X%02X%02X%02X%02X%02X",
+          deviceAddress[0], deviceAddress[1], deviceAddress[2], deviceAddress[3],
+          deviceAddress[4], deviceAddress[5], deviceAddress[6], deviceAddress[7]);
+}
+
+// Pin connected to 2N2222A base (GPIO3) to turn off power to LED ring via NPN transistor
+#define NPN_TRANSISTOR_PIN 3
+
+// LED ring
+#define LED_PIN 44 // Adjust if using a different GPIO
+#define NUM_LEDS 8
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Camera configuration
+#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
+
+// === Feature Toggles ===
+#define LIGHT_ALWAYS_ON false       // Set to true to keep LED ring on (soft white)
+#define READ_SENSORS_MINUTES 0.2      // Time in minutes between sensor readings
+#define READ_SENSORS_INTERVAL (READ_SENSORS_MINUTES * 60UL * 1000UL) // Time in ms
+
+// === Energy saving Toggles ===
+#define TAKE_PICTURES true          // Set to false to disable all photo capture/sending
+#define SMALL_IMAGE_SIZE false       // Set to true for smaller images to reduce battery drainage
+#define DEEP_SLEEP true             // Set to true deep sleep between sensor readings and photo captures
+#define DEEP_SLEEP_MINUTES 0.2       // Deep sleep duration in minutes
+#define DEEP_SLEEP_INTERVAL_US (DEEP_SLEEP_MINUTES * 60ULL * 1000000ULL)
+
+// === Storage Option ===
+#define SAVE_TO_SD_CARD false // Set to true to save images to SD card
+
+#include "camera_pins.h"
+
 
 unsigned long lastCaptureTime = 0; // Last shooting time
 int imageCount = 1;                // File Counter
@@ -152,6 +187,28 @@ void turnOffLedRing()
 {
   strip.clear();
   strip.show();
+}
+
+// SD card write file
+void writeFile(fs::FS &fs, const char *path, uint8_t *data, size_t len)
+{
+  Serial.printf("Writing file: %s\r\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if (!file)
+  {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  if (file.write(data, len) == len)
+  {
+    Serial.println("File written");
+  }
+  else
+  {
+    Serial.println("Write failed");
+  }
+  file.close();
 }
 
 // Save pictures to SD card
@@ -193,6 +250,21 @@ void photo_save(const char *fileName, const bool sd_sign)
 
   // Post photo
   // sendPhoto(fb);
+  
+  if (!SAVE_TO_SD_CARD)
+  {
+    Serial.println("Skipping SD card save (SAVE_TO_SD_CARD = false)");
+  }
+  else if (SAVE_TO_SD_CARD && sd_sign)
+  {
+    // Save photo to file
+    writeFile(SD, fileName, fb->buf, fb->len);
+    Serial.println("Photo saved to file");
+  }
+  else
+  {
+    Serial.printf("sd_sign = %d\n", sd_sign);
+  }
 
   // Release image buffer
   esp_camera_fb_return(fb);
@@ -239,6 +311,25 @@ void setup_espnow() {
   if (!esp_now_is_peer_exist(peerAddress)) {
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
       Serial.println("Failed to add ESP-NOW peer");
+    }
+  }
+}
+
+void reconnect()
+{
+  while (!client.connected())
+  {
+    Serial.print("Connecting to MQTT...");
+    if (client.connect("ESP32SolarClient", mqtt_user, mqtt_password))
+    {
+      Serial.println(" connected.");
+    }
+    else
+    {
+      Serial.print(" failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5s.");
+      delay(5000);
     }
   }
 }
@@ -326,11 +417,123 @@ void setup() {
 
   camera_sign = true; // Camera initialization check passes
 
+  // #if SAVE_TO_SD_CARD
+  //   // Initialize SD card
+  //   if (!SD.begin(21))
+  //   {
+  //     Serial.println("Card Mount Failed");
+  //   }
+  //   uint8_t cardType = SD.cardType();
+
+  //   // Determine if the type of SD card is available
+  //   if (cardType == CARD_NONE)
+  //   {
+  //     Serial.println("No SD card attached");
+  //   }
+
+  //   Serial.print("SD Card Type: ");
+  //   if (cardType == CARD_MMC)
+  //   {
+  //     Serial.println("MMC");
+  //   }
+  //   else if (cardType == CARD_SD)
+  //   {
+  //     Serial.println("SDSC");
+  //   }
+  //   else if (cardType == CARD_SDHC)
+  //   {
+  //     Serial.println("SDHC");
+  //   }
+  //   else
+  //   {
+  //     Serial.println("UNKNOWN");
+  //   }
+
+  //   sd_sign = true; // sd initialization check passes
+  // #else
+  //   sd_sign = false;
+  // #endif
+
+  // // Temp
+  // sensors.begin();
+
+  // // Start I2C on custom pins
+  // Wire.begin(5, 6); // SDA = 5, SCL = 6
+
+  // if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
+  // {
+  //   Serial.println("BH1750 sensor initialized");
+  // }
+  // else
+  // {
+  //   Serial.println("Error initializing BH1750 sensor. Check wiring.");
+  // }
+
   setupEndTime = millis();
 }
 
 void loop() {
   loopStartTime = millis();
+
+  // if (!client.connected())
+  // {
+  //   reconnect();
+  // }
+
+  // // Light sensor
+  // float lux = lightMeter.readLightLevel();
+  // Serial.print("Light: ");
+  // Serial.print(lux);
+  // Serial.println(" lx");
+  // delay(1000);
+
+  // // Temp sensors
+  // sensors.requestTemperatures();
+  // int deviceCount = sensors.getDeviceCount();
+  // Serial.print("Found ");
+  // Serial.print(deviceCount);
+  // Serial.println(" DS18B20 sensor(s).");
+
+  // for (int i = 0; i < deviceCount; i++)
+  // {
+  //   float tempC = sensors.getTempCByIndex(i);
+  //   // tempC += calibrationOffsets[i];
+
+  //   DeviceAddress sensorAddress;
+  //   sensors.getAddress(sensorAddress, i);
+
+  //   char sensorID[17];
+  //   addressToString(sensorAddress, sensorID);
+
+  //   Serial.print("Sensor ID ");
+  //   Serial.print(sensorID);
+  //   Serial.print(": ");
+  //   Serial.print(tempC);
+  //   Serial.println(" °C");
+
+  //   char tempString[8];
+  //   dtostrf(tempC, 6, 2, tempString);
+
+  //   String topic = "home/sensors/" + String(sensorID);
+  //   bool success = client.publish(topic.c_str(), tempString);
+
+  //   if (success)
+  //   {
+  //     Serial.println("MQTT message published successfully.");
+  //   }
+  //   else
+  //   {
+  //     Serial.println("Failed to publish MQTT message.");
+
+  //     if (!client.connected())
+  //     {
+  //       Serial.println("MQTT client not connected!");
+  //     }
+
+  //     Serial.print("MQTT client state: ");
+  //     Serial.println(client.state());
+  //   }
+  // }
 
   // === Conditional image capture and send ===
 
