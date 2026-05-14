@@ -22,7 +22,6 @@ Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
 
 // === Feature Toggles ===
-#define LIGHT_ALWAYS_ON false       // Set to true to keep LED ring on (soft white)
 #define READ_SENSORS_MINUTES 0.2      // Time in minutes between sensor readings
 #define READ_SENSORS_INTERVAL (READ_SENSORS_MINUTES * 60UL * 1000UL) // Time in ms
 
@@ -56,7 +55,7 @@ unsigned long setupEndTime = 0;
 unsigned long loopStartTime = 0;
 unsigned long loopEndTime = 0;
 
-void turnOnLedRing(uint8_t r = 255, uint8_t g = 0, uint8_t b = 0, uint8_t brightness = 255)
+void turnOnLedRing(uint8_t r = 255, uint8_t g = 0, uint8_t b = 0, uint8_t brightness = 60)
 {
   strip.setBrightness(brightness);
   for (int i = 0; i < NUM_LEDS; i++)
@@ -72,72 +71,52 @@ void turnOffLedRing()
   strip.show();
 }
 
-void photo_save(const char *fileName, const bool sd_sign)
+camera_fb_t *photo_save()
 {
-  // Turn on LED ring before taking the photo
-  turnOnLedRing(); // Default: white at brightness 30
-  delay(1000);     // Give time for illumination
-
   sensor_t* sensor = esp_camera_sensor_get();
+
   // To turn sensor out of deel sleep mode. Have to check if this is actually needed.
   // Based on form https://forum.seeedstudio.com/t/xiao-esp32s3-sense-camera-sleep-current/271258/32?page=3
   if (sensor && DEEP_SLEEP) {
      sensor->set_reg(sensor, 0x3008, 0x40, 0x00);
   }
 
-  camera_fb_t *fb = esp_camera_fb_get(); // dummy read
-  if (fb)
-    esp_camera_fb_return(fb); // return dummy
+  // dummy read code to wake up camera and improve capture success rate on first try
+  // turn this on if images are not being captured properly on the first try after deep sleep
+  // camera_fb_t *fb = esp_camera_fb_get(); 
+  // if (fb)
+  //   esp_camera_fb_return(fb); // return dummy
+  // delay(200); // short wait before real capture
 
-  delay(200); // short wait before real capture
-
-  fb = esp_camera_fb_get(); // real capture
-
-  if (!fb)
-  {
-    Serial.println("Failed to get camera frame buffer");
-    if (LIGHT_ALWAYS_ON)
-    {
-      // Soft white, low brightness (e.g., 64 out of 255)
-      turnOnLedRing(255, 255, 255, 64);
-    }
-    else
-    {
-      turnOffLedRing();
-    }
-    return;
+  camera_fb_t *fb = esp_camera_fb_get(); // real capture
+  
+  // Turn off LED ring after capture to save energy
+  if (DEEP_SLEEP) {
+    turnOffLedRing();
   }
-
-  // Post photo
-  // sendPhoto(fb);
-
-  // Release image buffer
-  esp_camera_fb_return(fb);
 
   // Power down camera sensor after use to save energy
   if (sensor && DEEP_SLEEP) {
     sensor->set_reg(sensor, 0x3008, 0x40, 0x40);
   }
 
-  delay(1000);
-  if (LIGHT_ALWAYS_ON)
+  if (!fb)
   {
-    // Soft white, low brightness (e.g., 64 out of 255)
-    turnOnLedRing(255, 255, 255, 64);
+    Serial.println("Failed to get camera frame buffer");
+    return nullptr;
   }
-  else
+
+  if (fb->len != IMAGE_TRANSMISSION_BASE_IMAGE_SIZE)
   {
-    turnOffLedRing();
+    Serial.println("Camera capture failed or unexpected size");
+    esp_camera_fb_return(fb);
+    return nullptr;
   }
+
+  return fb;
 }
 
-// === Globals ===
-int photoCount = 0;
-
-
-void setup() {
-  setupStartTime = millis();
-  
+void setup() {  
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
@@ -147,15 +126,16 @@ void setup() {
   // // Turn on power to LED ring via PNP transistor
   // pinMode(NPN_TRANSISTOR_PIN, OUTPUT);
   // digitalWrite(NPN_TRANSISTOR_PIN, HIGH); 
-
-  if (LIGHT_ALWAYS_ON)
-  {
-    // Soft white, low brightness (e.g., 64 out of 255)
-    turnOnLedRing(255, 255, 255, 64);
-  }
+  // setupStartTime = millis();
 
   // === ESP-NOW ===
   initializeESPNowSender(imageTransmissionConfig);
+
+  // Turning on LED right before camera requires a delay in between to illuminate the scene
+  // To save energy the LED ring is turned on in setup and camera setup is the delay needed for illumination
+  turnOnLedRing(); // Default: red at brightness 255
+
+  setupStartTime = millis();
 
   // === Camera Init ===
   camera_config_t config;
@@ -185,7 +165,6 @@ void setup() {
   config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.fb_count = 2;
 
   // camera init
   esp_err_t err = esp_camera_init(&config);
@@ -197,19 +176,21 @@ void setup() {
 
   sensor_t *s = esp_camera_sensor_get();
 
+  // Disable automatic controls
+  s->set_gain_ctrl(s, 0);     // AGC off
+  s->set_exposure_ctrl(s, 0); // AEC off
+  s->set_awb_gain(s, 0);      // AWB off
+
+  // Set fixed values manually
+  s->set_aec_value(s, 300);   // Exposure
+  s->set_agc_gain(s, 8);      // Gain
+
   // Adjustments for image in darker environement
   s->set_brightness(s, 2);  // -2 to 2
   s->set_contrast(s, 1);    // -2 to 2
-  s->set_saturation(s, -1); // -2 to 2 (less color noise)
+  s->set_saturation(s, -2); // -2 to 2 (less color noise)
 
-  s->set_gain_ctrl(s, 1);     // Auto gain on
-  s->set_exposure_ctrl(s, 1); // Auto exposure on
-  s->set_awb_gain(s, 1);      // Auto white balance
-
-  s->set_agc_gain(s, 30);    // Higher = brighter (0 to 30+)
-  s->set_aec_value(s, 1200); // Exposure time (0–1200+)
-
-  s->set_vflip(s, 1); // If your image is upside down
+  // s->set_vflip(s, 1); // If your image is upside down
 
   camera_sign = true; // Camera initialization check passes
 
@@ -219,13 +200,9 @@ void setup() {
 void loop() {
   loopStartTime = millis();
 
-  // === Conditional image capture and send ===
+  camera_fb_t *fb = photo_save();
 
-  camera_fb_t *fb = esp_camera_fb_get();
-
-  if (!fb || fb->len != IMAGE_TRANSMISSION_BASE_IMAGE_SIZE) {
-    Serial.println("Camera capture failed or unexpected size");
-    if (fb) esp_camera_fb_return(fb);
+  if (!fb) {
     goto sleep;
   }
 
