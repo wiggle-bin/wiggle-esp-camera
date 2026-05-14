@@ -7,6 +7,7 @@
 #include "esp_wifi.h"
 #include <esp_sleep.h>
 #include <EEPROM.h>
+#include "image_transmission.h"
 
 // === Image diff and conditional send ===
 #define BASE_IMAGE_SIZE (160 * 120) // For FRAMESIZE_QQVGA, grayscale
@@ -42,7 +43,7 @@ Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define READ_SENSORS_INTERVAL (READ_SENSORS_MINUTES * 60UL * 1000UL) // Time in ms
 
 // === Energy saving Toggles ===
-#define DEEP_SLEEP true             // Set to true deep sleep between sensor readings and photo captures
+#define DEEP_SLEEP false             // Set to true deep sleep between sensor readings and photo captures
 #define DEEP_SLEEP_MINUTES 0.2       // Deep sleep duration in minutes
 #define DEEP_SLEEP_INTERVAL_US (DEEP_SLEEP_MINUTES * 60ULL * 1000000ULL)
 
@@ -69,60 +70,7 @@ void sendHelloESPNow() {
   }
 }
 
-// === Image Downsampling and Packing ===
-// Downsample 160x120 grayscale to 80x60 (simple 2x2 average)
-void downsample_160x120_to_80x60(const uint8_t *src, uint8_t *dst) {
-  for (int y = 0; y < DOWNSAMPLED_HEIGHT; ++y) {
-    for (int x = 0; x < DOWNSAMPLED_WIDTH; ++x) {
-      int sum = 0;
-      int src_x = x * 2;
-      int src_y = y * 2;
-      sum += src[(src_y + 0) * 160 + (src_x + 0)];
-      sum += src[(src_y + 0) * 160 + (src_x + 1)];
-      sum += src[(src_y + 1) * 160 + (src_x + 0)];
-      sum += src[(src_y + 1) * 160 + (src_x + 1)];
-      dst[y * DOWNSAMPLED_WIDTH + x] = sum / 4;
-    }
-  }
-}
 
-// Quantize 8-bit grayscale to 4-bit (0-15)
-inline uint8_t quantize_4bit(uint8_t v) {
-  return v >> 4; // 0-255 -> 0-15
-}
-
-// Pack 4-bit grayscale pixels (2 per byte)
-void pack_4bit(const uint8_t *src, uint8_t *dst, int num_pixels) {
-  for (int i = 0; i < num_pixels / 2; ++i) {
-    uint8_t hi = quantize_4bit(src[i * 2]);
-    uint8_t lo = quantize_4bit(src[i * 2 + 1]);
-    dst[i] = (hi << 4) | (lo & 0x0F);
-  }
-}
-
-// === ESP-NOW Transmission ===
-void sendImageESPNow(const uint8_t *packed, size_t packed_len) {
-  // ESP-NOW max payload is 250 bytes
-  const size_t CHUNK_SIZE = 200; // Leave room for header
-  uint16_t total_chunks = (packed_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
-  for (uint16_t chunk = 0; chunk < total_chunks; ++chunk) {
-    size_t offset = chunk * CHUNK_SIZE;
-    size_t len = (offset + CHUNK_SIZE > packed_len) ? (packed_len - offset) : CHUNK_SIZE;
-    uint8_t buf[CHUNK_SIZE + 4];
-    buf[0] = (uint8_t)(chunk & 0xFF);
-    buf[1] = (uint8_t)((chunk >> 8) & 0xFF);
-    buf[2] = (uint8_t)(total_chunks & 0xFF);
-    buf[3] = (uint8_t)((total_chunks >> 8) & 0xFF);
-    memcpy(buf + 4, packed + offset, len);
-    esp_err_t result = esp_now_send(peerAddress, buf, len + 4);
-    if (result == ESP_OK) {
-      Serial.printf("ESP-NOW chunk %d/%d sent\n", chunk + 1, total_chunks);
-    } else {
-      Serial.printf("ESP-NOW send failed: %d\n", result);
-    }
-    delay(10); // Give time for radio
-  }
-}
 
 
 WiFiClient espClient;
@@ -154,7 +102,6 @@ void turnOffLedRing()
   strip.show();
 }
 
-// Save pictures to SD card
 void photo_save(const char *fileName, const bool sd_sign)
 {
   // Turn on LED ring before taking the photo
@@ -334,8 +281,9 @@ void loop() {
 
   // === Conditional image capture and send ===
 
-  bool shouldSend = false;
   camera_fb_t *fb = esp_camera_fb_get();
+
+  bool shouldSend = false;
 
   if (!fb || fb->len != BASE_IMAGE_SIZE) {
     Serial.println("Camera capture failed or unexpected size");
