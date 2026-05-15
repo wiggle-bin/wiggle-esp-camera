@@ -19,7 +19,7 @@ ImageTransmissionConfig imageTransmissionConfig = {RECEIVER_MAC, 9, 0};
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // === Feature Toggles ===
-#define READ_SENSORS_MINUTES 0.2      // Time in minutes between sensor readings
+#define READ_SENSORS_MINUTES 1      // Time in minutes between sensor readings
 #define READ_SENSORS_INTERVAL (READ_SENSORS_MINUTES * 60UL * 1000UL) // Time in ms
 
 // === Energy saving Toggles ===
@@ -82,7 +82,7 @@ void setup() {
 void loop() {
   loopStartTime = millis();
 
-  constexpr bool USE_DUMMY_READ = false;
+  constexpr bool USE_DUMMY_READ = true;
   camera_fb_t *fb = capturePhotoFrame(DEEP_SLEEP,
                                       USE_DUMMY_READ,
                                       IMAGE_TRANSMISSION_BASE_IMAGE_SIZE);

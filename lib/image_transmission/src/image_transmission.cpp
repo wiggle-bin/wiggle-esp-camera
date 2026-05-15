@@ -44,10 +44,17 @@ void initializeBaseImagePersistence(ImageTransmissionState &state) {
   }
 }
 
-void processFrameAndSendIfChanged(const uint8_t *frame,
-                                  ImageTransmissionState &state,
-                                  const ImageTransmissionConfig &config) {
-  bool shouldSend = false;
+ImageMetadata processFrameAndSendIfChanged(const uint8_t *frame,
+                                           ImageTransmissionState &state,
+                                           const ImageTransmissionConfig &config) {
+  // Always compute average grey value of the incoming frame
+  uint32_t greySum = 0;
+  for (size_t i = 0; i < IMAGE_TRANSMISSION_BASE_IMAGE_SIZE; ++i) {
+    greySum += frame[i];
+  }
+  uint8_t avgGrey = static_cast<uint8_t>(greySum / IMAGE_TRANSMISSION_BASE_IMAGE_SIZE);
+
+  ImageMetadata metadata = {0, 0, 0, avgGrey, false};
 
   if (!state.baseImageValid) {
     memcpy(state.baseImage, frame, IMAGE_TRANSMISSION_BASE_IMAGE_SIZE);
@@ -58,18 +65,27 @@ void processFrameAndSendIfChanged(const uint8_t *frame,
       EEPROM.write(i + 1, state.baseImage[i]);
     }
     EEPROM.commit();
-    return;
+    sendMetadataESPNow(config.peerAddress, metadata);
+    return metadata;
   }
 
   int diffSum = 0;
+  uint8_t maxDiff = 0;
+  uint16_t changedPixelCount = 0;
   for (size_t i = 0; i < IMAGE_TRANSMISSION_BASE_IMAGE_SIZE; ++i) {
-    diffSum += abs((int)frame[i] - (int)state.baseImage[i]);
+    uint8_t d = static_cast<uint8_t>(abs((int)frame[i] - (int)state.baseImage[i]));
+    diffSum += d;
+    if (d > maxDiff) maxDiff = d;
+    if (d > config.changeThreshold) ++changedPixelCount;
   }
 
-  int meanDiff = diffSum / IMAGE_TRANSMISSION_BASE_IMAGE_SIZE;
-  Serial.printf("Mean pixel diff: %d\n", meanDiff);
+  uint16_t meanDiff = static_cast<uint16_t>(diffSum / IMAGE_TRANSMISSION_BASE_IMAGE_SIZE);
+  metadata.meanDiff = meanDiff;
+  metadata.maxDiff = maxDiff;
+  metadata.changedPixelCount = changedPixelCount;
+  Serial.printf("Mean pixel diff: %d, max: %d, changed pixels: %d\n", meanDiff, maxDiff, changedPixelCount);
+
   if (meanDiff > config.changeThreshold) {
-    shouldSend = true;
     Serial.println("Change detected, sending image...");
     memcpy(state.baseImage, frame, IMAGE_TRANSMISSION_BASE_IMAGE_SIZE);
     EEPROM.write(0, 1);
@@ -77,21 +93,21 @@ void processFrameAndSendIfChanged(const uint8_t *frame,
       EEPROM.write(i + 1, state.baseImage[i]);
     }
     EEPROM.commit();
+
+    downsample_160x120_to_80x60(frame, state.downsampledImage);
+    pack_4bit(state.downsampledImage,
+              state.packedImage,
+              IMAGE_TRANSMISSION_DOWNSAMPLED_IMAGE_SIZE);
+    sendImageESPNow(config.peerAddress,
+                    state.packedImage,
+                    IMAGE_TRANSMISSION_DOWNSAMPLED_PACKED_SIZE);
+    metadata.imageSent = true;
   } else {
     Serial.println("No significant change.");
   }
 
-  if (!shouldSend) {
-    return;
-  }
-
-  downsample_160x120_to_80x60(frame, state.downsampledImage);
-  pack_4bit(state.downsampledImage,
-            state.packedImage,
-            IMAGE_TRANSMISSION_DOWNSAMPLED_IMAGE_SIZE);
-  sendImageESPNow(config.peerAddress,
-                  state.packedImage,
-                  IMAGE_TRANSMISSION_DOWNSAMPLED_PACKED_SIZE);
+  sendMetadataESPNow(config.peerAddress, metadata);
+  return metadata;
 }
 
 void downsample_160x120_to_80x60(const uint8_t *src, uint8_t *dst) {
@@ -124,20 +140,41 @@ void sendImageESPNow(const uint8_t *peerAddress, const uint8_t *packed, size_t p
   for (uint16_t chunk = 0; chunk < total_chunks; ++chunk) {
     size_t offset = chunk * chunkSize;
     size_t len = (offset + chunkSize > packed_len) ? (packed_len - offset) : chunkSize;
-    uint8_t buf[chunkSize + 4];
+    uint8_t buf[chunkSize + 5];
 
-    buf[0] = static_cast<uint8_t>(chunk & 0xFF);
-    buf[1] = static_cast<uint8_t>((chunk >> 8) & 0xFF);
-    buf[2] = static_cast<uint8_t>(total_chunks & 0xFF);
-    buf[3] = static_cast<uint8_t>((total_chunks >> 8) & 0xFF);
-    memcpy(buf + 4, packed + offset, len);
+    buf[0] = IMAGE_PACKET_TYPE_IMAGE;
+    buf[1] = static_cast<uint8_t>(chunk & 0xFF);
+    buf[2] = static_cast<uint8_t>((chunk >> 8) & 0xFF);
+    buf[3] = static_cast<uint8_t>(total_chunks & 0xFF);
+    buf[4] = static_cast<uint8_t>((total_chunks >> 8) & 0xFF);
+    memcpy(buf + 5, packed + offset, len);
 
-    esp_err_t result = esp_now_send(peerAddress, buf, len + 4);
+    esp_err_t result = esp_now_send(peerAddress, buf, len + 5);
     if (result == ESP_OK) {
       Serial.printf("ESP-NOW chunk %d/%d sent\n", chunk + 1, total_chunks);
     } else {
       Serial.printf("ESP-NOW send failed: %d\n", result);
     }
     delay(10);
+  }
+}
+
+void sendMetadataESPNow(const uint8_t *peerAddress, const ImageMetadata &metadata) {
+  uint8_t buf[8];
+  buf[0] = IMAGE_PACKET_TYPE_METADATA;
+  buf[1] = static_cast<uint8_t>(metadata.meanDiff & 0xFF);
+  buf[2] = static_cast<uint8_t>((metadata.meanDiff >> 8) & 0xFF);
+  buf[3] = metadata.maxDiff;
+  buf[4] = static_cast<uint8_t>(metadata.changedPixelCount & 0xFF);
+  buf[5] = static_cast<uint8_t>((metadata.changedPixelCount >> 8) & 0xFF);
+  buf[6] = metadata.avgGrey;
+  buf[7] = metadata.imageSent ? 1 : 0;
+  esp_err_t result = esp_now_send(peerAddress, buf, sizeof(buf));
+  if (result == ESP_OK) {
+    Serial.printf("Metadata sent — meanDiff: %d, maxDiff: %d, changedPixels: %d, avgGrey: %d, imageSent: %d\n",
+                  metadata.meanDiff, metadata.maxDiff, metadata.changedPixelCount,
+                  metadata.avgGrey, metadata.imageSent ? 1 : 0);
+  } else {
+    Serial.printf("Metadata send failed: %d\n", result);
   }
 }
