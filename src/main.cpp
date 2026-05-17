@@ -9,8 +9,8 @@
 ImageTransmissionState imageTransmissionState;
 ImageTransmissionConfig imageTransmissionConfig = {RECEIVER_MAC, 9, 0};
 
-// Pin connected to 2N2222A base (GPIO3) to turn off power to LED ring via NPN transistor
-#define NPN_TRANSISTOR_PIN 3
+// Pin connected to IRLB8747PBF gate (GPIO3) to turn off power to LED ring via MOSFET
+#define MOSFET_PIN 3
 
 // LED ring
 #define LED_PIN 44 // Adjust if using a different GPIO
@@ -19,11 +19,11 @@ ImageTransmissionConfig imageTransmissionConfig = {RECEIVER_MAC, 9, 0};
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // === Feature Toggles ===
-#define READ_SENSORS_MINUTES 1      // Time in minutes between sensor readings
+#define READ_SENSORS_MINUTES 0.2      // Time in minutes between sensor readings
 #define READ_SENSORS_INTERVAL (READ_SENSORS_MINUTES * 60UL * 1000UL) // Time in ms
 
 // === Energy saving Toggles ===
-#define DEEP_SLEEP false             // Set to true deep sleep between sensor readings and photo captures
+#define DEEP_SLEEP true             // Set to true deep sleep between sensor readings and photo captures
 #define DEEP_SLEEP_MINUTES 0.2       // Deep sleep duration in minutes
 #define DEEP_SLEEP_INTERVAL_US (DEEP_SLEEP_MINUTES * 60ULL * 1000000ULL)
 
@@ -60,10 +60,9 @@ void setup() {
 
   initializeBaseImagePersistence(imageTransmissionState);
 
-  // // Turn on power to LED ring via PNP transistor
-  // pinMode(NPN_TRANSISTOR_PIN, OUTPUT);
-  // digitalWrite(NPN_TRANSISTOR_PIN, HIGH); 
-  // setupStartTime = millis();
+  // Turn on power to LED ring via NPN mosfet
+  pinMode(MOSFET_PIN, OUTPUT);
+  digitalWrite(MOSFET_PIN, HIGH);
 
   // === ESP-NOW ===
   initializeESPNowSender(imageTransmissionConfig);
@@ -89,6 +88,9 @@ void loop() {
   
   // Turn off LED ring after capture to save energy
   turnOffLedRing();
+  // Turn LED ring power off via MOSFET to save energy during deep sleep
+  digitalWrite(MOSFET_PIN, LOW);  // MOSFET OFF
+  pinMode(LED_PIN, INPUT); // High-Z prevents parasitic powering through data line
 
   if (!fb) {
     goto sleep;
@@ -108,9 +110,7 @@ sleep:
 
   if (DEEP_SLEEP)
   {
-    // Turn LED ring power off via NPN transistor to save energy during deep sleep
-    digitalWrite(NPN_TRANSISTOR_PIN, LOW);  // NPN OFF
-    digitalWrite(LED_PIN, HIGH);
+
     // Turn off WiFi and Bluetooth to minimize power consumption
     // Have to check if this is actually needed
     WiFi.mode(WIFI_OFF);
@@ -129,6 +129,10 @@ sleep:
 
     // Immitating setup delay
     delay(42); // Image persistantce delay + esp-now setup delay
+    // Turn on power to LED ring via NPN mosfet
+    pinMode(MOSFET_PIN, OUTPUT);
+    digitalWrite(MOSFET_PIN, HIGH); 
+    // Turn on LED ring
     turnOnLedRing();
     delay(388); // Camera setup
   }
